@@ -1,0 +1,6 @@
+.venv/
+.naver_auth.json
+.ntfy_topic
+state.json
+shots/
+__pycache__/

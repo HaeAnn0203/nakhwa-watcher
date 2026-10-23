@@ -1,0 +1,68 @@
+name: watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: "테스트용 키워드 (비우면 낙화놀이)"
+        required: false
+      date:
+        description: "테스트용 날짜 YYYY-MM-DD (비우면 2026-11-07)"
+        required: false
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # 수동 테스트 실행은 실제 감시 상태(state.json)를 건드리지 않는다
+      - name: Restore state
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          KEYWORD: ${{ inputs.keyword }}
+          TARGET_DATE: ${{ inputs.date }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python watcher.py check
+          else
+            python watcher.py check --no-state
+          fi
+
+      - name: Save state
+        if: always() && github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shots
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 3
