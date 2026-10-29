@@ -1,26 +1,44 @@
 name: watch
 
+# GitHub 예약 실행(schedule)은 몇 시간씩 밀리므로, 실행 하나가 약 5시간 40분 동안 2분마다 검사하고
+# 시작하자마자 다음 실행을 예약해 둔다. 같은 그룹에서는 하나만 돌고 다음 것은 대기한다.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "7 * * * *"  # 반복이 끊겼을 때 다시 잇는 예비용
   workflow_dispatch:
     inputs:
       keyword:
-        description: "테스트용 키워드 (비우면 낙화놀이)"
+        description: "테스트용 키워드 (비우면 낙화놀이를 반복 감시)"
         required: false
       date:
         description: "테스트용 날짜 YYYY-MM-DD (비우면 2026-11-07)"
         required: false
 
 concurrency:
-  group: watch
+  group: ${{ inputs.keyword && format('test-{0}', github.run_id) || 'watch' }}
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 355
+    env:
+      LOOP: ${{ !inputs.keyword }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Queue next run
+        if: env.LOOP == 'true'
+        run: |
+          if [[ "$(TZ=Asia/Seoul date +%F)" > "2026-11-07" ]]; then
+            gh workflow disable watch.yml -R "$GITHUB_REPOSITORY"
+          else
+            gh workflow run watch.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -30,9 +48,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # 수동 테스트 실행은 실제 감시 상태(state.json)를 건드리지 않는다
+      # 테스트 실행은 실제 감시 상태(state.json)를 건드리지 않는다
       - name: Restore state
-        if: github.event_name == 'schedule'
+        if: env.LOOP == 'true'
         uses: actions/cache/restore@v4
         with:
           path: state.json
@@ -45,14 +63,14 @@ jobs:
           KEYWORD: ${{ inputs.keyword }}
           TARGET_DATE: ${{ inputs.date }}
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            python watcher.py check
+          if [ "$LOOP" = "true" ]; then
+            python watcher.py check --repeat-minutes 340 --interval 120
           else
             python watcher.py check --no-state
           fi
 
       - name: Save state
-        if: always() && github.event_name == 'schedule'
+        if: always() && env.LOOP == 'true'
         uses: actions/cache/save@v4
         with:
           path: state.json

@@ -13,6 +13,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -127,7 +128,7 @@ async def pick_date(page, day):
     cell = cells.first if d < 15 else cells.nth(n - 1)
     text = await cell.inner_text()
     cls = await cell.get_attribute("class") or ""
-    if "마감" in text:
+    if "마감" in text or "매진" in text:
         return "sold_out"
     if await cell.is_disabled() or "unselectable" in cls:
         return "unavailable"
@@ -185,38 +186,42 @@ async def submit_order(page):
     return f"submitted:{label} -> {target.url[:120]}"
 
 
-async def run_booking(ctx, item, day, submit):
+async def run_booking(ctx, item, day, submit, on_open):
     """상품 페이지에 들어가 날짜 선택 → 수량 1 → 다음(→ 로그인 상태면 최종 버튼)까지 진행."""
     page = await ctx.new_page()
-    url = with_date(item["href"], day)
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    status = await pick_date(page, day)
-    log("날짜 선택:", status)
-    if status != "selected":
-        await page.screenshot(path=str(SHOTS / f"date_{item['id']}.png"), full_page=True)
-        return status, url
-    if not await pick_time_and_qty(page):
-        await page.screenshot(path=str(SHOTS / f"qty_{item['id']}.png"), full_page=True)
-        return "no_quantity", url
-    nxt = page.locator(NEXT_BTN)
-    if "disabled" in (await nxt.get_attribute("class") or ""):
-        await page.screenshot(path=str(SHOTS / f"next_{item['id']}.png"), full_page=True)
-        return "next_disabled", url
-    await nxt.click()
-    await page.wait_for_load_state("domcontentloaded")
-    await page.wait_for_timeout(2000)
-    await page.screenshot(path=str(SHOTS / f"after_next_{item['id']}.png"), full_page=True)
-    log("다음 클릭 후:", page.url[:120])
-    if "nid.naver.com" in page.url:
-        return "next_clicked_login_required", url
-    if not submit:
-        return "next_clicked_order_form", url
-    return await submit_order(page), url
+    try:
+        await page.goto(with_date(item["href"], day), wait_until="domcontentloaded", timeout=30000)
+        status = await pick_date(page, day)
+        log("날짜 선택:", status)
+        if status != "selected":
+            await page.screenshot(path=str(SHOTS / f"date_{item['id']}.png"), full_page=True)
+            return status
+        # 로그인 없는 봇의 클릭으로는 표가 잡히지 않으므로, 사람이 바로 결제하도록 알림부터 보낸다
+        on_open()
+        if not await pick_time_and_qty(page):
+            await page.screenshot(path=str(SHOTS / f"qty_{item['id']}.png"), full_page=True)
+            return "no_quantity"
+        nxt = page.locator(NEXT_BTN)
+        if "disabled" in (await nxt.get_attribute("class") or ""):
+            await page.screenshot(path=str(SHOTS / f"next_{item['id']}.png"), full_page=True)
+            return "next_disabled"
+        await nxt.click()
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(2000)
+        await page.screenshot(path=str(SHOTS / f"after_next_{item['id']}.png"), full_page=True)
+        log("다음 클릭 후:", page.url[:120])
+        if "nid.naver.com" in page.url:
+            return "next_clicked_login_required"
+        if not submit:
+            return "next_clicked_order_form"
+        return await submit_order(page)
+    finally:
+        await page.close()
 
 
 STATUS_KO = {
     "selected": "날짜 선택됨",
-    "sold_out": "마감",
+    "sold_out": "매진",
     "unavailable": "선택 불가(휴무/판매 전)",
     "no_month": "해당 월 달력 없음(판매 전)",
     "no_day": "달력에 날짜 없음",
@@ -245,56 +250,88 @@ def save_state(path, state):
         Path(path).write_text(json.dumps(state, ensure_ascii=False, indent=1))
 
 
+async def check_once(ctx, state, args):
+    page = await ctx.new_page()
+    try:
+        items = await list_items(page)
+    except Exception as e:
+        state["fail_streak"] = state.get("fail_streak", 0) + 1
+        log("목록 조회 실패:", e)
+        await page.screenshot(path=str(SHOTS / "list_error.png"))
+        if state["fail_streak"] == 3 or state["fail_streak"] % 36 == 0:
+            notify("감시 스크립트 오류", f"예매 목록을 {state['fail_streak']}회 연속 못 읽었습니다: {e}",
+                   priority=3, tags=["warning"])
+        return 1
+    finally:
+        await page.close()
+    state["fail_streak"] = 0
+    log(f"목록 {len(items)}개:", " / ".join(i["name"] for i in items))
+    hits = [i for i in items if args.keyword in i["name"]]
+    if not hits:
+        log(f"'{args.keyword}' 상품 없음")
+    hit_ids = {i["id"] for i in hits}
+    for item_id, seen in state["seen"].items():
+        if item_id not in hit_ids and seen.get("present", True):
+            log("목록에서 사라짐:", seen["name"])
+            seen["present"] = False
+
+    when = args.date[5:].replace("-", "/")
+    for item in hits:
+        log("발견:", item["id"], item["name"])
+        prev = state["seen"].get(item["id"])
+        was_open = bool(prev) and prev.get("open", prev["status"].startswith(AVAILABLE))
+        url = with_date(item["href"], args.date)
+        opened = False
+
+        def on_open():
+            nonlocal opened
+            opened = True
+            if not was_open:
+                notify(f"[{args.keyword}] {when} 예매 가능!",
+                       f"{item['name']}\n{when} 표가 열렸습니다. 눌러서 바로 결제하세요.",
+                       click=url, priority=5, tags=["rotating_light"])
+
+        try:
+            status = await run_booking(ctx, item, args.date, args.submit, on_open)
+        except Exception as e:
+            status = f"자동 진행 실패: {e}".split("\n")[0][:200]
+        log("결과:", status)
+        if not opened and (prev is None or not prev.get("present", True)):
+            title = "예매 상품 등장" if prev is None else "예매 상품 다시 등장"
+            notify(f"[{args.keyword}] {title}",
+                   f"{item['name']}\n{when}: {describe(status)}\n표가 열리면 다시 알려 드립니다.",
+                   click=url, priority=4, tags=["bell"])
+        state["seen"][item["id"]] = {"name": item["name"], "status": status, "open": opened, "present": True,
+                                     "checked": datetime.now(KST).isoformat(timespec="seconds")}
+    return 0
+
+
 async def check(args):
+    """한 번 검사한다. --repeat-minutes를 주면 브라우저를 띄운 채 --interval초마다 반복한다."""
     SHOTS.mkdir(exist_ok=True)
-    today = datetime.now(KST).date().isoformat()
-    if today > args.date:
-        log(f"목표 날짜({args.date})가 지나 검사하지 않음")
-        return 0
     state = load_state(args.state)
+    deadline = time.monotonic() + args.repeat_minutes * 60
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel="chrome", headless=not args.headed)
         ctx = await browser.new_context(locale="ko-KR", user_agent=UA, viewport={"width": 480, "height": 900},
                                         storage_state=args.auth or None)
         try:
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            try:
-                items = await list_items(page)
-            except Exception as e:
-                state["fail_streak"] = state.get("fail_streak", 0) + 1
-                save_state(args.state, state)
-                log("목록 조회 실패:", e)
-                await page.screenshot(path=str(SHOTS / "list_error.png"))
-                if state["fail_streak"] == 3 or state["fail_streak"] % 36 == 0:
-                    notify("감시 스크립트 오류", f"예매 목록을 {state['fail_streak']}회 연속 못 읽었습니다: {e}",
-                           priority=3, tags=["warning"])
-                return 1
-            state["fail_streak"] = 0
-            log(f"목록 {len(items)}개:", " / ".join(i["name"] for i in items))
-            hits = [i for i in items if args.keyword in i["name"]]
-            if not hits:
-                log(f"'{args.keyword}' 상품 없음")
-            for item in hits:
-                log("발견:", item["id"], item["name"])
+            while True:
+                if datetime.now(KST).date().isoformat() > args.date:
+                    log(f"목표 날짜({args.date})가 지나 검사하지 않음")
+                    return 0
                 try:
-                    status, url = await run_booking(ctx, item, args.date, args.submit)
+                    rc = await check_once(ctx, state, args)
                 except Exception as e:
-                    status, url = f"자동 진행 실패: {e}".split("\n")[0][:200], with_date(item["href"], args.date)
-                log("결과:", status)
-                prev = state["seen"].get(item["id"])
-                ok = status.startswith(AVAILABLE)
-                was_ok = bool(prev) and prev["status"].startswith(AVAILABLE)
-                if prev is None or (ok and not was_ok):
-                    title = (f"[{args.keyword}] {args.date[5:].replace('-', '/')} 예매 가능!" if ok
-                             else f"[{args.keyword}] 예매 상품 등장")
-                    notify(title, f"{item['name']}\n{args.date}: {describe(status)}\n눌러서 바로 결제하세요.",
-                           click=url, priority=5 if ok else 4, tags=["rotating_light" if ok else "bell"])
-                state["seen"][item["id"]] = {"name": item["name"], "status": status,
-                                             "checked": datetime.now(KST).isoformat(timespec="seconds")}
-            save_state(args.state, state)
-            if args.headed and args.submit and hits:
-                await page.wait_for_timeout(5000)
-            return 0
+                    log("검사 중 오류:", e)
+                    rc = 1
+                save_state(args.state, state)
+                if time.monotonic() + args.interval > deadline:
+                    break
+                await asyncio.sleep(args.interval)
+            if args.headed and args.submit:
+                await asyncio.sleep(5)
+            return rc
         finally:
             await browser.close()
 
@@ -331,6 +368,8 @@ def main():
     c.add_argument("--auth", help="login 명령으로 저장한 네이버 로그인 쿠키 파일 (로컬 테스트용)")
     c.add_argument("--submit", action="store_true", help="로그인 상태면 주문서의 최종 버튼까지 누른다")
     c.add_argument("--headed", action="store_true")
+    c.add_argument("--repeat-minutes", type=float, default=0, help="이 시간(분) 동안 반복 검사")
+    c.add_argument("--interval", type=int, default=300, help="반복 검사 간격(초)")
     lg = sub.add_parser("login")
     lg.add_argument("--auth", default=".naver_auth.json")
     args = ap.parse_args()
